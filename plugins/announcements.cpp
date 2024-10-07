@@ -10,9 +10,7 @@
 #include "df/announcement_type.h"
 #include "df/world.h"
 
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 using std::deque;
 using std::string;
@@ -38,8 +36,15 @@ enum ConfigValues {
     CONFIG_IS_ENABLED = 0,
 };
 
+// should be small enough such that the number of reports between cycles is less
+// than 3000 - MAX_TOTAL_ANNOUNCEMENTS
 static const int32_t CYCLE_TICKS = 11;
+
+// periodically refresh our bucket contents to make sure we stay in sync -- just in
+// case something else has modified the reports vector
 static const int32_t REFRESH_CYCLE_TICKS = 19937;
+
+// world->frame_counter timestamps of last successful cycle
 static int32_t cycle_timestamp = 0;
 static int32_t refresh_cycle_timestamp = 0;
 
@@ -48,10 +53,21 @@ struct AnnouncementBucket {
     deque<df::report> elems;
 };
 
-static const size_t MAX_BUCKET_RESERVED_SIZE = 2000;  // max reserved size for an individual bucket
-static const size_t MAX_TOTAL_ANNOUNCEMENTS = 2500;  // DF vector is 3000 elements; leave enough room so we don't churn
+// max reserved reports, cumulative across all buckets
+static const size_t MAX_TOTAL_RESERVED = 2000;
 
+// DF vector is 3000 elements. this should be smaller than that by the number of reports
+// we expect to see in one cycle check (see CYCLE_TICKS). if this number is too close to
+// 3000, the DF vector can exceed the 3000 length limit and DF will start evicting
+// elements, which will likely be our reserved elements. we will then restore those
+// elements and cause churn.
+static const size_t MAX_TOTAL_ANNOUNCEMENTS = 2500;
+
+// contains copies of reserved reports so we can reinstate them if necessary
 static unordered_map<df::announcement_alert_type, AnnouncementBucket> buckets;
+
+// updated to be the report id of the most recent report in the reports vector so we can
+// track which reports we've already processed
 static int newest_seen_id;
 
 static command_result do_command(color_ostream &out, vector<string> &parameters);
@@ -63,7 +79,6 @@ DFhackCExport command_result plugin_init(color_ostream &out, std::vector <Plugin
         plugin_name,
         "Prevent important announcements from getting lost.",
         do_command));
-
 
     return CR_OK;
 }
@@ -110,7 +125,7 @@ static void load_bucket_defaults(color_ostream &out) {
         buckets[aat].reserved_size = reserved_size;
         cumulative_reserved_size += reserved_size;
     }
-    DEBUG(control,out).print("cumulative reserved size: %zd\n", cumulative_reserved_size);
+    DEBUG(control,out).print("default cumulative reserved size: %zd\n", cumulative_reserved_size);
 }
 
 static void clear_state() {
@@ -182,6 +197,7 @@ DFhackCExport command_result plugin_load_site_data (color_ostream &out) {
                             is_enabled ? "true" : "false");
 
     vector<string> settings;
+    size_t cumulative_reserved_size = 0;
     split_string(&settings, config.get_str(), "/");
     for (auto & setting : settings) {
         vector<string> elems;
@@ -192,9 +208,14 @@ DFhackCExport command_result plugin_load_site_data (color_ostream &out) {
         if (!buckets.contains(bucket_id))
             continue;
         size_t reserved_size = string_to_int(elems[1], -1);
-        if (reserved_size > MAX_BUCKET_RESERVED_SIZE)
-            continue;
         buckets[bucket_id].reserved_size = reserved_size;
+        cumulative_reserved_size += reserved_size;
+        if (cumulative_reserved_size > MAX_TOTAL_RESERVED) {
+            WARN(control,out).print(
+                "announcements: cumulative reserved size too large (%zd); reverting to defaults\n", cumulative_reserved_size);
+            load_bucket_defaults(out);
+            break;
+        }
     }
 
     full_refresh(out);
@@ -253,12 +274,40 @@ static command_result do_command(color_ostream &out, vector<string> &parameters)
 // cycle logic
 //
 
-static void get_new_reports(const vector<df::report *> & reports) {
+static void get_new_reports(color_ostream &out, const vector<df::report *> & reports) {
+    size_t added = 0;
     for (int idx = (int)reports.size() - 1; idx >= 0; --idx) {
         auto rep = reports[idx];
         if (rep->id <= newest_seen_id)
             break;
+        TRACE(cycle,out).print("adding report %d: %s\n", rep->id, ENUM_KEY_STR(announcement_type, rep->type).c_str());
         add_to_bucket(rep);
+        ++added;
+    }
+    if (added) {
+        DEBUG(cycle,out).print("added %zd new report(s)\n", added);
+    }
+}
+
+static void reinstate_reports(color_ostream &out, vector<df::report *> & reports) {
+    int oldest_id = reports.empty() ? INT32_MAX : reports[0]->id;
+    size_t reinstated = 0;
+    for (auto &[_, bucket] : buckets) {
+        if (bucket.elems.empty() || bucket.elems.front().id > oldest_id)
+            continue;
+        for (auto & elem : bucket.elems) {
+            if (elem.id >= oldest_id)
+                break;
+            TRACE(cycle,out).print("reinstating report %d: %s\n", elem.id, ENUM_KEY_STR(announcement_type, elem.type).c_str());
+            df::report * new_rep = new df::report();
+            *new_rep = elem;
+            insert_into_vector(reports, &df::report::id, new_rep);
+            ++reinstated;
+            // we could potentially remember whether the report had an associated announcement and restore it here
+        }
+    }
+    if (reinstated) {
+        DEBUG(cycle,out).print("reinstated %zd report(s)\n", reinstated);
     }
 }
 
@@ -278,6 +327,7 @@ static void scrub_reports(color_ostream &out, vector<df::report *> & reports) {
     for (size_t idx = 0; idx < num_reports; ++idx) {
         auto rep = reports[idx];
         if (remaining > 0 && !is_reserved(rep)) {
+            TRACE(cycle,out).print("evicting report %d: %s\n", rep->id, ENUM_KEY_STR(announcement_type, rep->type).c_str());
             if (rep->flags.bits.announcement)
                 erase_from_vector(announcements, &df::report::id, rep->id);
             delete rep;
@@ -292,22 +342,6 @@ static void scrub_reports(color_ostream &out, vector<df::report *> & reports) {
     reports.resize(kept);
 }
 
-static void reinstate_reports(vector<df::report *> & reports) {
-    int oldest_id = reports.empty() ? INT32_MAX : reports[0]->id;
-    for (auto &[_, bucket] : buckets) {
-        if (bucket.elems.empty() || bucket.elems.front().id > oldest_id)
-            continue;
-        for (auto & elem : bucket.elems) {
-            if (elem.id >= oldest_id)
-                break;
-            df::report * new_rep = new df::report();
-            *new_rep = elem;
-            insert_into_vector(reports, &df::report::id, new_rep);
-            // we could potentially remember whether the report had an associated announcement and restore it here
-        }
-    }
-}
-
 static void do_cycle(color_ostream &out) {
     cycle_timestamp = world->frame_counter;
 
@@ -316,13 +350,13 @@ static void do_cycle(color_ostream &out) {
     auto &reports = world->status.reports;
 
     // add new reports to our buckets
-    get_new_reports(reports);
+    get_new_reports(out, reports);
+
+    // reinstate reserved reports that are older than the current oldest ID
+    reinstate_reports(out, reports);
 
     // if we are over our threshold, evict oldest items (respecting reserved elements)
     scrub_reports(out, reports);
-
-    // reinstate reserved reports that are older than the current oldest ID
-    reinstate_reports(reports);
 
     newest_seen_id = reports.empty() ? -1 : reports[reports.size()-1]->id;
 }
