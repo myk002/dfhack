@@ -5,9 +5,10 @@
 
 #include "modules/World.h"
 
-#include "df/report.h"
+#include "df/announcement_alertst.h"
 #include "df/announcement_alert_type.h"
 #include "df/announcement_type.h"
+#include "df/report.h"
 #include "df/world.h"
 
 #include <unordered_map>
@@ -34,11 +35,13 @@ static PersistentDataItem config;
 
 enum ConfigValues {
     CONFIG_IS_ENABLED = 0,
+    CONFIG_REMOVE_SPARRING = 1,
 };
 
 // should be small enough such that the number of reports between cycles is less
 // than 3000 - MAX_TOTAL_ANNOUNCEMENTS
 static const int32_t CYCLE_TICKS = 11;
+static const int32_t CYCLE_TICKS_REMOVE_SPARRING = 1;
 
 // periodically refresh our bucket contents to make sure we stay in sync -- just in
 // case something else has modified the reports vector
@@ -69,6 +72,9 @@ static unordered_map<df::announcement_alert_type, AnnouncementBucket> buckets;
 // updated to be the report id of the most recent report in the reports vector so we can
 // track which reports we've already processed
 static int newest_seen_id;
+
+// cache the oldest id in our reserved buckets so reinstate_reports can bail quickly if there is nothing to do
+static int oldest_reserved_id;
 
 static command_result do_command(color_ostream &out, vector<string> &parameters);
 static void do_cycle(color_ostream &out);
@@ -132,6 +138,7 @@ static void clear_state() {
     for (auto &[_, bucket] : buckets)
         bucket.elems.clear();
     newest_seen_id = -1;
+    oldest_reserved_id = -1;
 }
 
 static df::announcement_alert_type get_bucket_id(df::announcement_type at) {
@@ -144,8 +151,11 @@ static void add_to_bucket(const df::report * rep) {
     auto & bucket = buckets[get_bucket_id(rep->type)];
     if (bucket.reserved_size) {
         bucket.elems.emplace_back(*rep);
-        if (bucket.elems.size() > bucket.reserved_size)
+        if (bucket.elems.size() > bucket.reserved_size) {
+            if (bucket.elems.front().id == oldest_reserved_id)
+                oldest_reserved_id = -1;
             bucket.elems.pop_front();
+        }
     }
 }
 
@@ -244,10 +254,12 @@ DFhackCExport command_result plugin_onstatechange(color_ostream &out, state_chan
 }
 
 DFhackCExport command_result plugin_onupdate(color_ostream &out) {
-    if (world->frame_counter - cycle_timestamp >= CYCLE_TICKS)
+    int32_t cycle_ticks = config.get_bool(CONFIG_REMOVE_SPARRING) ? CYCLE_TICKS_REMOVE_SPARRING : CYCLE_TICKS;
+    if (world->frame_counter - cycle_timestamp >= cycle_ticks) {
         do_cycle(out);
-    if (world->frame_counter - refresh_cycle_timestamp >= REFRESH_CYCLE_TICKS)
-        full_refresh(out);
+        if (world->frame_counter - refresh_cycle_timestamp >= REFRESH_CYCLE_TICKS)
+            full_refresh(out);
+    }
     return CR_OK;
 }
 
@@ -274,36 +286,91 @@ static command_result do_command(color_ostream &out, vector<string> &parameters)
 // cycle logic
 //
 
-static void get_new_reports(color_ostream &out, const vector<df::report *> & reports) {
+class AnnouncementDeleter {
+public:
+    void delete_report(df::report *rep) {
+        ensure_initialized();
+        if (rep->flags.bits.announcement) {
+            erase_from_vector(world->status.announcements, &df::report::id, rep->id);
+            auto att = get_bucket_id(rep->type);
+            if (announcement_ids.contains(att))
+                erase_from_vector(*announcement_ids[att], rep->id);
+        }
+        delete rep;
+    }
+
+private:
+    void ensure_initialized() {
+        if (initialized)
+            return;
+        for (auto elem : world->status.announcement_alert)
+            announcement_ids.emplace(elem->type, &elem->announcement_id);
+        initialized = true;
+    }
+
+    bool initialized = false;
+    unordered_map<df::announcement_alert_type, vector<int32_t>*> announcement_ids;
+};
+
+static void process_new_reports(color_ostream &out, vector<df::report *> & reports,
+    AnnouncementDeleter & deleter, bool remove_sparring)
+{
     size_t added = 0;
-    for (int idx = (int)reports.size() - 1; idx >= 0; --idx) {
+    int sparring_idx = -1;
+    int num_reports = (int)reports.size();
+    for (int idx = num_reports - 1; idx >= 0; --idx) {
         auto rep = reports[idx];
         if (rep->id <= newest_seen_id)
             break;
-        TRACE(cycle,out).print("adding report %d: %s\n", rep->id, ENUM_KEY_STR(announcement_type, rep->type).c_str());
+        if (remove_sparring && get_bucket_id(rep->type) == df::announcement_alert_type::SPARRING) {
+            TRACE(cycle,out).print("deleting sparring report %d\n", rep->id);
+            deleter.delete_report(rep);
+            reports[idx] = NULL;
+            sparring_idx = idx;
+            continue;
+        }
+        TRACE(cycle,out).print("adding report %d: %s (%s)\n", rep->id,
+            ENUM_KEY_STR(announcement_type, rep->type).c_str(),
+            ENUM_KEY_STR(announcement_alert_type, get_bucket_id(rep->type)).c_str());
         add_to_bucket(rep);
         ++added;
     }
     if (added) {
         DEBUG(cycle,out).print("added %zd new report(s)\n", added);
     }
+    if (remove_sparring && sparring_idx > -1) {
+        // compact vector
+        int off = 0;
+        for (int idx = sparring_idx; idx < num_reports; ++idx) {
+            if (!reports[idx])
+                continue;
+            reports[sparring_idx + off++] = reports[idx];
+        }
+        reports.resize(sparring_idx + off + 1);
+    }
 }
 
 static void reinstate_reports(color_ostream &out, vector<df::report *> & reports) {
     int oldest_id = reports.empty() ? INT32_MAX : reports[0]->id;
+    if (oldest_reserved_id != -1 && oldest_reserved_id >= oldest_id)
+        return;
+
     size_t reinstated = 0;
     for (auto &[_, bucket] : buckets) {
         if (bucket.elems.empty() || bucket.elems.front().id > oldest_id)
             continue;
         for (auto & elem : bucket.elems) {
+            if (oldest_reserved_id == -1 || oldest_reserved_id > elem.id)
+                oldest_reserved_id = elem.id;
             if (elem.id >= oldest_id)
                 break;
-            TRACE(cycle,out).print("reinstating report %d: %s\n", elem.id, ENUM_KEY_STR(announcement_type, elem.type).c_str());
+            TRACE(cycle,out).print("reinstating report %d: %s (%s)\n", elem.id,
+                ENUM_KEY_STR(announcement_type, elem.type).c_str(),
+                ENUM_KEY_STR(announcement_alert_type, get_bucket_id(elem.type)).c_str());
             df::report * new_rep = new df::report();
             *new_rep = elem;
             insert_into_vector(reports, &df::report::id, new_rep);
             ++reinstated;
-            // we could potentially remember whether the report had an associated announcement and restore it here
         }
     }
     if (reinstated) {
@@ -311,11 +378,9 @@ static void reinstate_reports(color_ostream &out, vector<df::report *> & reports
     }
 }
 
-static void scrub_reports(color_ostream &out, vector<df::report *> & reports) {
+static void scrub_reports(color_ostream &out, vector<df::report *> & reports, AnnouncementDeleter & deleter) {
     if (reports.size() <= MAX_TOTAL_ANNOUNCEMENTS)
         return;
-
-    auto &announcements = world->status.announcements;
 
     const size_t num_reports = reports.size();
 
@@ -327,10 +392,10 @@ static void scrub_reports(color_ostream &out, vector<df::report *> & reports) {
     for (size_t idx = 0; idx < num_reports; ++idx) {
         auto rep = reports[idx];
         if (remaining > 0 && !is_reserved(rep)) {
-            TRACE(cycle,out).print("evicting report %d: %s\n", rep->id, ENUM_KEY_STR(announcement_type, rep->type).c_str());
-            if (rep->flags.bits.announcement)
-                erase_from_vector(announcements, &df::report::id, rep->id);
-            delete rep;
+            TRACE(cycle,out).print("evicting report %d: %s (%s)\n", rep->id,
+                ENUM_KEY_STR(announcement_type, rep->type).c_str(),
+                ENUM_KEY_STR(announcement_alert_type, get_bucket_id(rep->type)).c_str());
+            deleter.delete_report(rep);
             --remaining;
         } else {
             if (idx > kept)
@@ -342,21 +407,111 @@ static void scrub_reports(color_ostream &out, vector<df::report *> & reports) {
     reports.resize(kept);
 }
 
+static void scrub_sparring(color_ostream &out) {
+    auto & announcement_alert = world->status.announcement_alert;
+    int num_bubbles = (int)announcement_alert.size();
+    for (int idx = num_bubbles - 1; idx >= 0; --idx) {
+        auto vec = announcement_alert[idx];
+        if (vec->type == df::announcement_alert_type::SPARRING) {
+            TRACE(cycle,out).print("removing sparring bubble\n");
+            delete vec;
+            vector_erase_at(announcement_alert, idx);
+            break;
+        }
+    }
+}
+
 static void do_cycle(color_ostream &out) {
     cycle_timestamp = world->frame_counter;
 
     TRACE(cycle,out).print("running %s cycle\n", plugin_name);
 
     auto &reports = world->status.reports;
+    AnnouncementDeleter deleter;
+    bool remove_sparring = config.get_bool(CONFIG_REMOVE_SPARRING);
 
-    // add new reports to our buckets
-    get_new_reports(out, reports);
+    // add new reports to our buckets and potentially cull sparring reports
+    process_new_reports(out, reports, deleter, remove_sparring);
 
     // reinstate reserved reports that are older than the current oldest ID
     reinstate_reports(out, reports);
 
     // if we are over our threshold, evict oldest items (respecting reserved elements)
-    scrub_reports(out, reports);
+    scrub_reports(out, reports, deleter);
+
+    if (remove_sparring)
+        scrub_sparring(out);
 
     newest_seen_id = reports.empty() ? -1 : reports[reports.size()-1]->id;
 }
+
+/////////////////////////////////////////////////////
+// Lua API
+//
+
+static bool announcements_setReserved(color_ostream &out, df::announcement_alert_type att, int32_t val) {
+    DEBUG(control,out).print("announcements_setReserved: %s -> %d\n", ENUM_KEY_STR(announcement_alert_type, att).c_str(), val);
+    if (!buckets.contains(att) || val < 0)
+        return false;
+
+    size_t cumulative_reserved_size = 0;
+    for (auto &[bucket_id, bucket] : buckets) {
+        if (att == bucket_id)
+            cumulative_reserved_size += val;
+        else
+            cumulative_reserved_size += bucket.reserved_size;
+        if (cumulative_reserved_size > MAX_TOTAL_RESERVED) {
+            WARN(control,out).print("cumulative reserved size too large (%zd)\n", cumulative_reserved_size);
+            return false;
+        }
+    }
+    buckets[att].reserved_size = val;
+    return true;
+}
+
+static int announcements_getReserved(color_ostream &out, df::announcement_alert_type att) {
+    DEBUG(control,out).print("announcements_getReserved: %s\n", ENUM_KEY_STR(announcement_alert_type, att).c_str());
+    if (!buckets.contains(att))
+        return -1;
+    return (int)buckets[att].reserved_size;
+}
+
+static void announcements_setRemoveSparring(color_ostream &out, bool val) {
+    DEBUG(control,out).print("announcements_setRemoveSparring: %s\n", val ? "true" : "false");
+    config.set_bool(CONFIG_REMOVE_SPARRING, val);
+}
+
+static bool announcements_getRemoveSparring(color_ostream &out) {
+    DEBUG(control,out).print("announcements_getRemoveSparring\n");
+    return config.get_bool(CONFIG_REMOVE_SPARRING);
+}
+
+static int announcements_getReportCountByType(lua_State *L) {
+    color_ostream *out = Lua::GetOutput(L);
+    if (!out)
+        out = &Core::getInstance().getConsole();
+
+    DEBUG(control,*out).print("announcements_getReportCountByType\n");
+    unordered_map<int32_t, int32_t> ret;
+    for (auto rep : world->status.reports) {
+        TRACE(control,*out).print("report %d of type %s classified as %s\n", rep->id,
+            ENUM_KEY_STR(announcement_type, rep->type).c_str(),
+            ENUM_KEY_STR(announcement_alert_type, get_bucket_id(rep->type)).c_str());
+        ret[get_bucket_id(rep->type)]++;
+    }
+    Lua::Push(L, ret);
+    return 1;
+}
+
+DFHACK_PLUGIN_LUA_FUNCTIONS {
+    DFHACK_LUA_FUNCTION(announcements_setReserved),
+    DFHACK_LUA_FUNCTION(announcements_getReserved),
+    DFHACK_LUA_FUNCTION(announcements_setRemoveSparring),
+    DFHACK_LUA_FUNCTION(announcements_getRemoveSparring),
+    DFHACK_LUA_END
+};
+
+DFHACK_PLUGIN_LUA_COMMANDS {
+    DFHACK_LUA_COMMAND(announcements_getReportCountByType),
+    DFHACK_LUA_END
+};
