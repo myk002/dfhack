@@ -403,6 +403,10 @@ bool DFHack::Job::removeJob(df::job* job) {
     using df::global::world;
     CHECK_NULL_POINTER(job);
 
+    // attempting to cancel a special job crashes
+    if (job->flags.bits.special)
+        return false;
+
     // cancel_job below does not clean up all refs, so we have to do some work
     for (auto &item_ref : job->items) {
         disconnectJobItem(job, item_ref);
